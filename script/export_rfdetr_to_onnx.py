@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-"""
-Export a pre-trained (or fine-tuned) RF-DETR model to ONNX format for
-TensorRT/C++ inference.
+r"""
+Export a pre-trained (or fine-tuned) RF-DETR model to ONNX format.
 
 Uses the official roboflow/rf-detr Python package. Defaults match the
 `large` variant at 704x704 - the confirmed choice for the rf_detr_trt_backend
@@ -19,9 +18,9 @@ Usage:
     python export_rfdetr_to_onnx.py --output-dir onnxs
 
     # Fine-tuned KITTI checkpoint (variant auto-inferred from the checkpoint)
-    python export_rfdetr_to_onnx.py \\
-        --checkpoint runs/kitti-large/checkpoint_best_ema.pth \\
-        --num-classes 3 \\
+    python export_rfdetr_to_onnx.py \
+        --checkpoint runs/kitti-large/checkpoint_best_ema.pth \
+        --num-classes 3 \
         --output-dir onnxs
 """
 
@@ -56,7 +55,7 @@ def parse_args():
     ap.add_argument('--num-classes', type=int, default=90,
                     help='Number of foreground classes (excluding background). '
                          'Stock COCO checkpoints use 90; override to match your '
-                         'fine-tuned checkpoint\'s class count (e.g. 3 for a '
+                         "fine-tuned checkpoint's class count (e.g. 3 for a "
                          'Car/Pedestrian/Cyclist KITTI fine-tune).')
     ap.add_argument('--opset', type=int, default=17, help='ONNX opset version')
     ap.add_argument('--output-dir', type=str, default='onnxs',
@@ -87,7 +86,7 @@ def main():
         raise ValueError(
             f'RF-DETR requires a square input (height must equal width), got '
             f'height={args.height}, width={args.width}. Windowed attention in '
-            f'the DINOv2 backbone has no non-square path - see the port\'s '
+            f"the DINOv2 backbone has no non-square path - see the port's "
             f'design notes.')
 
     out_dir = Path(args.output_dir)
@@ -134,7 +133,7 @@ def main():
             f'{out_dir} - checked {[str(p) for p in known_candidates]} and '
             f'the newest-file fallback. Run `ls {out_dir}` to see what the '
             f'installed rfdetr package actually wrote, and update this '
-            f'script\'s known_candidates list to match.')
+            f"script's known_candidates list to match.")
     src.rename(dst)
     print(f'Renamed {src.name} -> {dst.name}')
     print(f'ONNX model saved to: {dst}')
@@ -155,7 +154,7 @@ def main():
         if missing:
             print(f'WARNING: expected output(s) {missing} not found in the '
                   f'exported graph (found: {sorted(output_names)}). '
-                  f'rf_detr_trt_backend\'s find_tensor_names() falls back to '
+                  f"rf_detr_trt_backend's find_tensor_names() falls back to "
                   f'positional matching, but exact names are safer.')
     except ImportError:
         print('onnx package not available - skipping model validation (pip install onnx)')
