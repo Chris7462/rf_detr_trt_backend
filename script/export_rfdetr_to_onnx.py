@@ -26,8 +26,6 @@ Usage:
 """
 
 import argparse
-import json
-import os
 from pathlib import Path
 
 
@@ -107,8 +105,12 @@ def main():
         opset_version=args.opset,
     )
 
-    # model.export() always writes "inference_model.onnx" into output_dir -
-    # rename to match cmake/Config.cmake's ONNX_FILE = "${MODEL_NAME}.onnx".
+    # model.export()'s output filename convention has been observed to vary
+    # by rfdetr package version - some versions write "inference_model.onnx"
+    # (per the package's own docs), others write "rfdetr-<variant>.onnx".
+    # Rather than hardcode one, check known candidates first, then fall back
+    # to "the .onnx file most recently written to out_dir" - robust to
+    # naming changes in future package versions too.
     basename = f'rf_detr_{args.variant}_{args.height}x{args.width}'
     dst = out_dir / f'{basename}.onnx'
 
@@ -159,23 +161,6 @@ def main():
         print('onnx package not available - skipping model validation (pip install onnx)')
     except Exception as e:
         print(f'ONNX model validation failed: {e}')
-
-    # Reference sidecar for humans only - NOT read by the C++ backend.
-    # rf_detr_trt_backend uses Config (passed by the caller), not a JSON
-    # sidecar, by design.
-    meta = {
-        'variant': args.variant,
-        'input_h': args.height,
-        'input_w': args.width,
-        'num_classes': args.num_classes,
-        'mean': [0.485, 0.456, 0.406],
-        'std': [0.229, 0.224, 0.225],
-        'color_order': 'RGB',
-        'checkpoint': args.checkpoint or 'stock-coco-pretrained',
-    }
-    meta_path = out_dir / f'{basename}.reference.json'
-    meta_path.write_text(json.dumps(meta, indent=2) + '\n')
-    print(f'Wrote reference metadata (informational only): {meta_path}')
 
     print('ONNX export completed.')
 
