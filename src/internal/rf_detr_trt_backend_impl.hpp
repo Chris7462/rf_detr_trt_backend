@@ -9,6 +9,7 @@
 
 #include "rf_detr_trt_backend/rf_detr_trt_backend.hpp"
 #include "internal/trt_logger.hpp"
+#include "internal/cuda_raii.hpp"
 
 namespace rf_detr_trt_backend
 {
@@ -26,7 +27,6 @@ private:
   void initialize_memory(const RFDetrTrtBackend::Config & config);
   void initialize_streams();
   void warmup_engine(const RFDetrTrtBackend::Config & config);
-  void cleanup() noexcept;
   std::vector<uint8_t> load_engine_file(const std::string & engine_path) const;
   void upload_and_preprocess(
     const cv::Mat & image, const RFDetrTrtBackend::Config & config, cudaStream_t stream) const;
@@ -47,20 +47,15 @@ private:
 
   struct MemoryBuffers
   {
-    unsigned char * device_input_raw;
-    float * device_preprocessed;
-    float * device_dets;
-    float * device_labels;
-    float * pinned_dets;
-    float * pinned_labels;
-
-    MemoryBuffers()
-    : device_input_raw(nullptr), device_preprocessed(nullptr),
-      device_dets(nullptr), device_labels(nullptr),
-      pinned_dets(nullptr), pinned_labels(nullptr) {}
+    internal::DevPtr device_input_raw;
+    internal::DevPtr device_preprocessed;
+    internal::DevPtr device_dets;
+    internal::DevPtr device_labels;
+    internal::HostPtr pinned_dets;
+    internal::HostPtr pinned_labels;
   } buffers_;
 
-  cudaStream_t stream_ = nullptr;
+  internal::StreamPtr stream_;
 };
 
 }

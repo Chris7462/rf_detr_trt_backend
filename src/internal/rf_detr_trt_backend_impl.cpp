@@ -14,10 +14,29 @@
 namespace rf_detr_trt_backend
 {
 
-RFDetrTrtBackend::Impl::~Impl()
+namespace
 {
-  cleanup();
+
+// Allocate device memory and immediately wrap it in an owning DevPtr, so
+// there is no window where a raw, unmanaged pointer exists in caller scope.
+internal::DevPtr cuda_malloc_dev(size_t bytes)
+{
+  void * p = nullptr;
+  CUDA_CHECK(cudaMalloc(&p, bytes));
+  return internal::DevPtr(p);
 }
+
+// Same idea for pinned host memory.
+internal::HostPtr cuda_malloc_host(size_t bytes)
+{
+  void * p = nullptr;
+  CUDA_CHECK(cudaMallocHost(&p, bytes));
+  return internal::HostPtr(p);
+}
+
+} // namespace
+
+RFDetrTrtBackend::Impl::~Impl() = default;
 
 void RFDetrTrtBackend::Impl::initialize(
   const std::string & engine_path, const RFDetrTrtBackend::Config & config)
@@ -55,21 +74,21 @@ Detections RFDetrTrtBackend::Impl::infer(
   }
 
   // Upload + normalize directly into GPU memory
-  upload_and_preprocess(image, config, stream_);
+  upload_and_preprocess(image, config, stream_.get());
 
   // Run inference
-  if (!context_->enqueueV3(stream_)) {
+  if (!context_->enqueueV3(stream_.get())) {
     throw internal::TensorRTException("Failed to enqueue inference");
   }
 
   // Copy both outputs back to pinned host memory for CPU-side decode
-  CUDA_CHECK(cudaMemcpyAsync(buffers_.pinned_dets, buffers_.device_dets,
-    dets_size_, cudaMemcpyDeviceToHost, stream_));
-  CUDA_CHECK(cudaMemcpyAsync(buffers_.pinned_labels, buffers_.device_labels,
-    labels_size_, cudaMemcpyDeviceToHost, stream_));
+  CUDA_CHECK(cudaMemcpyAsync(buffers_.pinned_dets.get(), buffers_.device_dets.get(),
+    dets_size_, cudaMemcpyDeviceToHost, stream_.get()));
+  CUDA_CHECK(cudaMemcpyAsync(buffers_.pinned_labels.get(), buffers_.device_labels.get(),
+    labels_size_, cudaMemcpyDeviceToHost, stream_.get()));
 
   // Wait for completion
-  CUDA_CHECK(cudaStreamSynchronize(stream_));
+  CUDA_CHECK(cudaStreamSynchronize(stream_.get()));
 
   // Decode on CPU. Boxes come out in the square input's own pixel space
   // (config.width x config.height) - un-letterboxing to the original image
@@ -82,7 +101,8 @@ Detections RFDetrTrtBackend::Impl::infer(
   params.bg_class_index = internal::kBackgroundClassIndex;
 
   return internal::decode_detections(
-    buffers_.pinned_dets, buffers_.pinned_labels,
+    static_cast<const float *>(buffers_.pinned_dets.get()),
+    static_cast<const float *>(buffers_.pinned_labels.get()),
     config.width, config.height, params);
 }
 
@@ -169,85 +189,53 @@ void RFDetrTrtBackend::Impl::initialize_memory(const RFDetrTrtBackend::Config & 
   dets_size_ = static_cast<size_t>(config.num_queries) * 4 * sizeof(float);
   labels_size_ = static_cast<size_t>(config.num_queries) * num_classes_with_bg * sizeof(float);
 
-  // Allocate device memory
-  CUDA_CHECK(cudaMalloc(&buffers_.device_input_raw, input_size_));
-  CUDA_CHECK(cudaMalloc(&buffers_.device_preprocessed, preprocessed_size_));
-  CUDA_CHECK(cudaMalloc(&buffers_.device_dets, dets_size_));
-  CUDA_CHECK(cudaMalloc(&buffers_.device_labels, labels_size_));
+  // Allocate device memory. If a later allocation throws, everything
+  // already assigned above is freed automatically as the exception unwinds
+  // through Impl's constructor path - no manual cleanup() bookkeeping.
+  buffers_.device_input_raw = cuda_malloc_dev(input_size_);
+  buffers_.device_preprocessed = cuda_malloc_dev(preprocessed_size_);
+  buffers_.device_dets = cuda_malloc_dev(dets_size_);
+  buffers_.device_labels = cuda_malloc_dev(labels_size_);
 
   // Allocate pinned host memory for reading the two outputs back
-  CUDA_CHECK(cudaMallocHost(&buffers_.pinned_dets, dets_size_));
-  CUDA_CHECK(cudaMallocHost(&buffers_.pinned_labels, labels_size_));
+  buffers_.pinned_dets = cuda_malloc_host(dets_size_);
+  buffers_.pinned_labels = cuda_malloc_host(labels_size_);
 
   // Bind tensor addresses. Three boolean-returning TensorRT calls (vs.
   // fcn_trt_backend's two) is exactly the repetition TRT_CHECK exists for.
   TRT_CHECK(context_->setTensorAddress(
-    input_name_.c_str(), static_cast<void *>(buffers_.device_preprocessed)));
+    input_name_.c_str(), buffers_.device_preprocessed.get()));
   TRT_CHECK(context_->setTensorAddress(
-    dets_name_.c_str(), static_cast<void *>(buffers_.device_dets)));
+    dets_name_.c_str(), buffers_.device_dets.get()));
   TRT_CHECK(context_->setTensorAddress(
-    labels_name_.c_str(), static_cast<void *>(buffers_.device_labels)));
+    labels_name_.c_str(), buffers_.device_labels.get()));
 }
 
 void RFDetrTrtBackend::Impl::initialize_streams()
 {
-  CUDA_CHECK(cudaStreamCreate(&stream_));
-  if (!stream_) {
-    throw internal::TensorRTException("Failed to create CUDA stream");
-  }
+  cudaStream_t raw = nullptr;
+  CUDA_CHECK(cudaStreamCreate(&raw));
+  stream_.reset(raw);
 }
 
 void RFDetrTrtBackend::Impl::warmup_engine(const RFDetrTrtBackend::Config & config)
 {
-  CUDA_CHECK(cudaMemsetAsync(buffers_.device_input_raw, 0, input_size_, stream_));
+  CUDA_CHECK(cudaMemsetAsync(buffers_.device_input_raw.get(), 0, input_size_, stream_.get()));
 
   for (int i = 0; i < config.warmup_iterations; ++i) {
     internal::launch_preprocess_kernel(
-      buffers_.device_input_raw, buffers_.device_preprocessed,
-      config.mean, config.std, config.width, config.height, stream_);
+      static_cast<unsigned char *>(buffers_.device_input_raw.get()),
+      static_cast<float *>(buffers_.device_preprocessed.get()),
+      config.mean, config.std, config.width, config.height, stream_.get());
 
-    if (!context_->enqueueV3(stream_)) {
+    if (!context_->enqueueV3(stream_.get())) {
       throw internal::TensorRTException("Failed to enqueue warmup inference");
     }
 
-    CUDA_CHECK(cudaStreamSynchronize(stream_));
+    CUDA_CHECK(cudaStreamSynchronize(stream_.get()));
   }
 
   std::cout << "Engine warmed up with " << config.warmup_iterations << " iterations" << std::endl;
-}
-
-void RFDetrTrtBackend::Impl::cleanup() noexcept
-{
-  // Free pinned host memory
-  if (buffers_.pinned_dets) {
-    cudaFreeHost(buffers_.pinned_dets);
-  }
-  if (buffers_.pinned_labels) {
-    cudaFreeHost(buffers_.pinned_labels);
-  }
-
-  // Free device memory
-  if (buffers_.device_input_raw) {
-    cudaFree(buffers_.device_input_raw);
-  }
-  if (buffers_.device_preprocessed) {
-    cudaFree(buffers_.device_preprocessed);
-  }
-  if (buffers_.device_dets) {
-    cudaFree(buffers_.device_dets);
-  }
-  if (buffers_.device_labels) {
-    cudaFree(buffers_.device_labels);
-  }
-
-  // Reset all pointers to nullptr (good practice)
-  buffers_ = MemoryBuffers{};
-
-  // Destroy stream safely
-  if (stream_) {
-    cudaStreamDestroy(stream_);
-    stream_ = nullptr;  // Mark as destroyed
-  }
 }
 
 std::vector<uint8_t> RFDetrTrtBackend::Impl::load_engine_file(
@@ -278,11 +266,12 @@ void RFDetrTrtBackend::Impl::upload_and_preprocess(
   // staging buffer would make the copy itself marginally faster, but
   // infer() already synchronizes on this stream before returning, so there
   // is no cross-frame overlap to lose - not worth the extra complexity here.
-  CUDA_CHECK(cudaMemcpyAsync(buffers_.device_input_raw, image.data,
+  CUDA_CHECK(cudaMemcpyAsync(buffers_.device_input_raw.get(), image.data,
     input_size_, cudaMemcpyHostToDevice, stream));
 
   internal::launch_preprocess_kernel(
-    buffers_.device_input_raw, buffers_.device_preprocessed,
+    static_cast<unsigned char *>(buffers_.device_input_raw.get()),
+    static_cast<float *>(buffers_.device_preprocessed.get()),
     config.mean, config.std, config.width, config.height, stream);
 }
 
