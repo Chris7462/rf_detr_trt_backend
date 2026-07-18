@@ -25,14 +25,9 @@ class RFDetrTrtBackendTest : public ::testing::Test
 protected:
   void SetUp() override
   {
-    // Configure the inferencer. Left at Config's stock defaults (large
-    // variant, 90 COCO classes) - no engine-specific overrides needed until
-    // a fine-tuned KITTI checkpoint changes num_classes.
+    // Configure the inferencer. No engine-specific overrides needed until
+    // a fine-tuned KITTI checkpoint changes normalization stats.
     rf_detr_trt_backend::RFDetrTrtBackend::Config conf;
-    conf.height = input_size_;
-    conf.width = input_size_;
-    conf.num_queries = num_queries_;
-    conf.num_classes = num_classes_;
     conf.warmup_iterations = 2;
     conf.log_level = rf_detr_trt_backend::LogLevel::kInfo;
 
@@ -41,6 +36,15 @@ protected:
     } catch (const std::exception & e) {
       GTEST_SKIP() << "Failed to initialize TensorRT inferencer: " << e.what();
     }
+
+    // Read back the engine-resolved geometry now that construction has
+    // succeeded.
+    // INTO Config; now they're read back FROM the loaded engine, so this
+    // test can no longer silently drift out of sync with whatever
+    // engine_path_ actually points to.
+    input_size_ = detector->input_height();  // == input_width() - square-only, enforced at construction
+    num_queries_ = detector->num_queries();
+    num_classes_ = detector->num_classes();
   }
 
   void TearDown() override
@@ -101,9 +105,9 @@ protected:
   const std::string image_path_ = "image_000.png";
 
 public:
-  const int input_size_ = 704;
-  const int num_queries_ = 300;
-  const int num_classes_ = 90;
+  int input_size_ = 0;
+  int num_queries_ = 0;
+  int num_classes_ = 0;
 
 private:
   // engine_path_ stays private: only ever used inside SetUp(), a member of
@@ -145,7 +149,7 @@ TEST_F(RFDetrTrtBackendTest, TestBasicInference)
 }
 
 // Directly exercises infer()'s hard-require-exact-size contract: a
-// non-square, non-config-sized image must throw rather than be silently
+// non-square, non-engine-sized image must throw rather than be silently
 // resized (see RFDetrTrtBackend::infer()'s doc comment).
 TEST_F(RFDetrTrtBackendTest, TestThrowsOnWrongSize)
 {

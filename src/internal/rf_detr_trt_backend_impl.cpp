@@ -43,7 +43,7 @@ void RFDetrTrtBackend::Impl::initialize(
 {
   initialize_engine(engine_path, config);
   find_tensor_names();
-  initialize_memory(config);
+  initialize_memory();
   initialize_streams();
   // NOTE: no initialize_constants() step here, unlike fcn_trt_backend.
   // mean/std are passed as per-call kernel arguments (see
@@ -58,12 +58,16 @@ Detections RFDetrTrtBackend::Impl::infer(
   // Hard-require the caller (the ROS2 node) to have already produced an
   // exactly-sized, contiguous BGR8 image. No resizing happens here - see
   // RFDetrTrtBackend::infer()'s doc comment for the rationale.
-  if (image.rows != config.height || image.cols != config.width ||
+  //
+  // input_height_/input_width_ are resolved from the engine's own input
+  // tensor shape in find_tensor_names() - never from Config - so this check
+  // can never disagree with what the engine actually expects.
+  if (image.rows != input_height_ || image.cols != input_width_ ||
     image.type() != CV_8UC3)
   {
     throw std::invalid_argument(
       "RFDetrTrtBackend::infer(): image must be exactly " +
-      std::to_string(config.height) + "x" + std::to_string(config.width) +
+      std::to_string(input_height_) + "x" + std::to_string(input_width_) +
       " CV_8UC3, got " + std::to_string(image.rows) + "x" +
       std::to_string(image.cols) + " (type " + std::to_string(image.type()) + ")");
   }
@@ -91,19 +95,19 @@ Detections RFDetrTrtBackend::Impl::infer(
   CUDA_CHECK(cudaStreamSynchronize(stream_.get()));
 
   // Decode on CPU. Boxes come out in the square input's own pixel space
-  // (config.width x config.height) - un-letterboxing to the original image
+  // (input_width_ x input_height_) - un-letterboxing to the original image
   // is the caller's responsibility, one layer up.
   internal::PostprocessParams params;
-  params.num_queries = config.num_queries;
-  params.num_classes_with_bg = config.num_classes + 1;
-  params.topk = config.num_queries;
+  params.num_queries = num_queries_;
+  params.num_classes_with_bg = num_classes_with_bg_;
+  params.topk = num_queries_;
   params.threshold = config.score_threshold;
   params.bg_class_index = internal::kBackgroundClassIndex;
 
   return internal::decode_detections(
     static_cast<const float *>(buffers_.pinned_dets.get()),
     static_cast<const float *>(buffers_.pinned_labels.get()),
-    config.width, config.height, params);
+    input_width_, input_height_, params);
 }
 
 void RFDetrTrtBackend::Impl::initialize_engine(
@@ -177,17 +181,64 @@ void RFDetrTrtBackend::Impl::find_tensor_names()
       "(a segmentation engine with a third 'masks' output is not supported "
       "by this detection-only backend)");
   }
+
+  // Resolve model geometry from the engine's own tensor shapes. This is the
+  // single source of truth - RFDetrTrtBackend::Config no longer carries
+  // height/width/num_queries/num_classes, so there is nothing for these
+  // values to disagree with.
+
+  // Input tensor: NCHW (or CHW without an explicit batch dim, depending on
+  // how the engine was exported) - height/width are always the last two
+  // dims regardless of which case this is.
+  const nvinfer1::Dims input_dims = engine_->getTensorShape(input_name_.c_str());
+  if (input_dims.nbDims < 2) {
+    throw internal::TensorRTException(
+      "Engine input tensor '" + input_name_ + "' has unexpected rank " +
+      std::to_string(input_dims.nbDims) + " (expected at least 2)");
+  }
+  input_height_ = input_dims.d[input_dims.nbDims - 2];
+  input_width_ = input_dims.d[input_dims.nbDims - 1];
+
+  if (input_height_ != input_width_) {
+    throw internal::TensorRTException(
+      "Engine input is non-square (" + std::to_string(input_height_) + "x" +
+      std::to_string(input_width_) + ") - RFDetrTrtBackend requires square "
+      "input (windowed backbone attention has no non-square path)");
+  }
+
+  // dets: (num_queries, 4)
+  const nvinfer1::Dims dets_dims = engine_->getTensorShape(dets_name_.c_str());
+  if (dets_dims.nbDims < 2) {
+    throw internal::TensorRTException(
+      "Engine 'dets' tensor has unexpected rank " + std::to_string(dets_dims.nbDims) +
+      " (expected at least 2)");
+  }
+  num_queries_ = dets_dims.d[dets_dims.nbDims - 2];
+
+  // labels: (num_queries, num_classes_with_bg)
+  const nvinfer1::Dims labels_dims = engine_->getTensorShape(labels_name_.c_str());
+  if (labels_dims.nbDims < 2) {
+    throw internal::TensorRTException(
+      "Engine 'labels' tensor has unexpected rank " + std::to_string(labels_dims.nbDims) +
+      " (expected at least 2)");
+  }
+  if (labels_dims.d[labels_dims.nbDims - 2] != num_queries_) {
+    throw internal::TensorRTException(
+      "Engine 'dets' and 'labels' tensors disagree on num_queries (" +
+      std::to_string(num_queries_) + " vs " +
+      std::to_string(labels_dims.d[labels_dims.nbDims - 2]) + ")");
+  }
+  num_classes_with_bg_ = labels_dims.d[labels_dims.nbDims - 1];
 }
 
-void RFDetrTrtBackend::Impl::initialize_memory(const RFDetrTrtBackend::Config & config)
+void RFDetrTrtBackend::Impl::initialize_memory()
 {
-  const int num_classes_with_bg = config.num_classes + 1;
-
-  // Calculate memory sizes
-  input_size_ = static_cast<size_t>(config.height) * config.width * 3 * sizeof(unsigned char);
-  preprocessed_size_ = static_cast<size_t>(3) * config.height * config.width * sizeof(float);
-  dets_size_ = static_cast<size_t>(config.num_queries) * 4 * sizeof(float);
-  labels_size_ = static_cast<size_t>(config.num_queries) * num_classes_with_bg * sizeof(float);
+  // Calculate memory sizes from the engine-resolved geometry (see
+  // find_tensor_names()), not from Config.
+  input_size_ = static_cast<size_t>(input_height_) * input_width_ * 3 * sizeof(unsigned char);
+  preprocessed_size_ = static_cast<size_t>(3) * input_height_ * input_width_ * sizeof(float);
+  dets_size_ = static_cast<size_t>(num_queries_) * 4 * sizeof(float);
+  labels_size_ = static_cast<size_t>(num_queries_) * num_classes_with_bg_ * sizeof(float);
 
   // Allocate device memory. If a later allocation throws, everything
   // already assigned above is freed automatically as the exception unwinds
@@ -226,7 +277,7 @@ void RFDetrTrtBackend::Impl::warmup_engine(const RFDetrTrtBackend::Config & conf
     internal::launch_preprocess_kernel(
       static_cast<unsigned char *>(buffers_.device_input_raw.get()),
       static_cast<float *>(buffers_.device_preprocessed.get()),
-      config.mean, config.std, config.width, config.height, stream_.get());
+      config.mean, config.std, input_width_, input_height_, stream_.get());
 
     if (!context_->enqueueV3(stream_.get())) {
       throw internal::TensorRTException("Failed to enqueue warmup inference");
@@ -272,7 +323,7 @@ void RFDetrTrtBackend::Impl::upload_and_preprocess(
   internal::launch_preprocess_kernel(
     static_cast<unsigned char *>(buffers_.device_input_raw.get()),
     static_cast<float *>(buffers_.device_preprocessed.get()),
-    config.mean, config.std, config.width, config.height, stream);
+    config.mean, config.std, input_width_, input_height_, stream);
 }
 
 } // namespace rf_detr_trt_backend

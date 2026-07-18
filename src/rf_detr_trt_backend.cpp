@@ -26,4 +26,24 @@ Detections RFDetrTrtBackend::infer(const cv::Mat & image)
   return impl_->infer(image, config_);
 }
 
+int RFDetrTrtBackend::input_height() const noexcept
+{
+  return impl_->input_height();
+}
+
+int RFDetrTrtBackend::input_width() const noexcept
+{
+  return impl_->input_width();
+}
+
+int RFDetrTrtBackend::num_queries() const noexcept
+{
+  return impl_->num_queries();
+}
+
+int RFDetrTrtBackend::num_classes() const noexcept
+{
+  return impl_->num_classes();
+}
+
 } // namespace rf_detr_trt_backend

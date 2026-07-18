@@ -55,12 +55,21 @@ using Detections = std::vector<Detection>;
 class RFDetrTrtBackend
 {
 public:
+  // NOTE: height, width, num_queries, and num_classes are intentionally NOT
+  // configurable here. They are properties of the loaded .engine file, not
+  // runtime choices - there is no valid scenario where a caller would want
+  // RFDetrTrtBackend to use a value different from what the engine actually
+  // has. They are resolved from the engine's own tensor shapes at
+  // construction time (see find_tensor_names()/initialize_memory() in
+  // Impl) and exposed read-only via input_height()/input_width()/
+  // num_queries()/num_classes() below, once construction succeeds.
+  //
+  // mean/std remain configurable because, unlike the fields above, they are
+  // not retrievable from the engine itself - they are Python-side constants
+  // that existed only at ONNX export time and never made it into the .engine
+  // file.
   struct Config
   {
-    int height;
-    int width;
-    int num_queries;
-    int num_classes;
     float mean[3];
     float std[3];
     float score_threshold;
@@ -68,8 +77,7 @@ public:
     LogLevel log_level;
 
     Config()
-    : height(704), width(704), num_queries(300), num_classes(90),
-      mean{0.485f, 0.456f, 0.406f}, std{0.229f, 0.224f, 0.225f},
+    : mean{0.485f, 0.456f, 0.406f}, std{0.229f, 0.224f, 0.225f},
       score_threshold(0.5f), warmup_iterations(2),
       log_level(LogLevel::kWarning) {}
   };
@@ -83,6 +91,16 @@ public:
   RFDetrTrtBackend & operator=(RFDetrTrtBackend &&) = delete;
 
   Detections infer(const cv::Mat & image);
+
+  // Model geometry, resolved from the engine's own tensor shapes at
+  // construction time. Only valid to call after construction succeeds
+  // (construction throws on failure, so if you have a live instance, these
+  // are safe to call).
+  int input_height() const noexcept;
+  int input_width() const noexcept;
+  int num_queries() const noexcept;
+  // Dense foreground class count (excludes the background/no-object slot).
+  int num_classes() const noexcept;
 
 private:
   Config config_;

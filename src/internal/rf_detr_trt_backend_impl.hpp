@@ -21,10 +21,20 @@ public:
   void initialize(const std::string & engine_path, const RFDetrTrtBackend::Config & config);
   Detections infer(const cv::Mat & image, const RFDetrTrtBackend::Config & config);
 
+  // Model geometry, resolved from the engine's own tensor shapes in
+  // find_tensor_names(). Only meaningful after initialize() has succeeded.
+  int input_height() const noexcept {return input_height_;}
+  int input_width() const noexcept {return input_width_;}
+  int num_queries() const noexcept {return num_queries_;}
+  // Dense foreground class count (num_classes_with_bg_ - 1, excludes the
+  // background/no-object slot) - matches what RFDetrTrtBackend::Config used
+  // to call "num_classes" before it was removed as a configurable field.
+  int num_classes() const noexcept {return num_classes_with_bg_ - 1;}
+
 private:
   void initialize_engine(const std::string & engine_path, const RFDetrTrtBackend::Config & config);
   void find_tensor_names();
-  void initialize_memory(const RFDetrTrtBackend::Config & config);
+  void initialize_memory();
   void initialize_streams();
   void warmup_engine(const RFDetrTrtBackend::Config & config);
   std::vector<uint8_t> load_engine_file(const std::string & engine_path) const;
@@ -44,6 +54,14 @@ private:
   size_t preprocessed_size_ = 0;
   size_t dets_size_ = 0;
   size_t labels_size_ = 0;
+
+  // Model geometry, resolved from the engine's own tensor shapes in
+  // find_tensor_names() - see the class-level comment on the accessors
+  // above. Never sourced from Config.
+  int input_height_ = 0;
+  int input_width_ = 0;
+  int num_queries_ = 0;
+  int num_classes_with_bg_ = 0;  // includes the background/no-object slot
 
   struct MemoryBuffers
   {
